@@ -1,0 +1,35 @@
+[
+  {
+    "class":"firrtl.EmitCircuitAnnotation",
+    "emitter":"firrtl.VerilogEmitter"
+  },
+  {
+    "class":"chisel3.experimental.EnumAnnotations$EnumDefAnnotation",
+    "typeName":"personcnn.St",
+    "definition":{
+      "fin":6,
+      "gapDrain":5,
+      "drain":3,
+      "gap":4,
+      "cfg":1,
+      "conv":2,
+      "done":7,
+      "idle":0
+    }
+  },
+  {
+    "class":"chisel3.experimental.EnumAnnotations$EnumComponentAnnotation",
+    "target":"PersonCnn.PersonCnn.state",
+    "enumTypeName":"personcnn.St"
+  },
+  {
+    "class":"firrtl.transforms.BlackBoxTargetDirAnno",
+    "targetDir":"generated"
+  },
+  {
+    "class":"firrtl.annotations.MemoryFileInlineAnnotation",
+    "target":"~PersonCnn|PersonCnn>wRom",
+    "filename":"golden_out/w_all_merged.hex",
+    "hexOrBinary":"h"
+  }
+]
