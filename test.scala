@@ -71,13 +71,14 @@ class LoopCnt(w: Int) {
  * Fully pipelined version (every stage = registers -> small logic -> registers).
  *
  *  S0 counters (flop-only enable chain)
- *  S1 iy/ix/weight index            S2 pad, shifts, weight BRAM out
- *  S3 partial addr sum              S4 final addr (register -> BRAM address)
+ *  S1 iy/ix/weight index            S2 padY/padX, shifts, weight BRAM out
+ *  S3 partial addr sum + pad OR     S4 final addr (register -> BRAM address)
  *  S5 BRAM data                     S6 pixel/shift select
  *  S7 shift                         S8 +/- sign
- *  S9 accumulate (+ BN ROM read)    S10-11 multiply (DSP regs)
- *  S12 + Bq                         S13 >>> SH
- *  S14 clamp                        S15 2x2 max + registered BRAM write
+ *  S9 accumulate (+ BN ROM read)    S10 multiply (DSP MREG)
+ *  S11 + Bq (DSP PREG)              S12 sign + overflow mask + coarse shift (step 8)
+ *  S13 fine shift (0..7)            S14 flat ReLU + clamp[0,63]
+ *  S15 2x2 max + registered BRAM write
  */
 class PersonCnn(cfg: CnnConfig) extends Module {
   import cfg._
@@ -93,7 +94,16 @@ class PersonCnn(cfg: CnnConfig) extends Module {
     val dOut     = Output(SInt(32.W))   // D = acc_fc1 - acc_fc0
   })
 
-  val AW = log2Ceil(actDepth)
+  val AW    = log2Ceil(actDepth)
+  val accW  = 24
+  val prodW = accW + mBits
+  val sumW  = math.max(prodW, bqBits) + 1          // 41
+
+  // mask bit >= sh+6 : nếu có bit 1 trong vùng này thì (sum >> sh) > 63
+  val ovMaskV = VecInit((sh :+ sh.last).map { s =>
+    (((BigInt(1) << sumW) - 1) & ~((BigInt(1) << (s + 6)) - 1)).U(sumW.W)
+  })
+  val ovMaskR = RegInit(0.U(sumW.W))
 
   // ---------------- ROMs ----------------
   val wAllValues = (0 until nLayers).flatMap(i => HexIO.unsigned(s"$hexDir/w_L$i.hex"))
@@ -167,9 +177,13 @@ class PersonCnn(cfg: CnnConfig) extends Module {
   kx.step(run); ky.step(enKy); ci.step(enCi); px.step(enPx)
   py.step(enPy); ocol.step(enCol); orow.step(enRow); co.step(enCo)
 
-  val lastTap  = kx.last && ky.last && ci.last
-  val firstTap = k === 0.U
-  when(run) { k := Mux(lastTap, 0.U, k + 1.U) }
+  val firstTapR = RegInit(true.B)
+  val lastTap   = kx.last && ky.last && ci.last
+  val firstTap  = firstTapR
+  when(run) {
+    k         := Mux(lastTap, 0.U, k + 1.U)
+    firstTapR := lastTap
+  }
   when(enCo) {
     wCoBase := wCoBase + cin9R
     bnPtr   := bnPtr + 1.U
@@ -204,28 +218,29 @@ class PersonCnn(cfg: CnnConfig) extends Module {
 
   val rU  = Mux(poolR, Cat(orow.cnt, py.cnt), orow.cnt)
   val cU  = Mux(poolR, Cat(ocol.cnt, px.cnt), ocol.cnt)
-  val iy0 = z(rU) + z(ky.cnt) - 1.S
-  val ix0 = z(cU) + z(kx.cnt) - 1.S
+  val dyV = VecInit(Seq(-1, 0, 1, 0).map(_.S(3.W)))
+  val iy0 = z(rU) +& dyV(ky.cnt)
+  val ix0 = z(cU) +& dyV(kx.cnt)
 
   // ---------------- S1 ----------------
-  val c1    = stage(c0)
-  val iy1   = RegNext(iy0)
-  val ix1   = RegNext(ix0)
-  val ci1   = RegNext(ci.cnt)
-  val wIdx1 = RegNext(wCoBase + k)
+  val c1     = stage(c0)
+  val iy1    = RegNext(iy0)
+  val ix1    = RegNext(ix0)
+  val ci1    = RegNext(ci.cnt)
+  val wIdx1  = RegNext(wCoBase + k)
   val wcode2 = wRom.read(wIdx1, c1.v)
 
-  // ---------------- S2: pad flag, address terms, weight BRAM out ----------------
-  val c2     = stage(c1)
-  val pad1   = iy1 < 0.S || iy1 >= z(hinR) || ix1 < 0.S || ix1 >= z(hinR)
-  val pad2   = RegNext(pad1)
-  val ciSh2  = RegNext((ci1 << lgHinwR)(AW - 1, 0))
-  val iySh2  = RegNext((iy1.asUInt << lgHinR)(AW - 1, 0))
-  val ix2    = RegNext(ix1.asUInt.pad(AW)(AW - 1, 0))
+  // ---------------- S2: padY/padX flags, address terms, weight BRAM out ----------------
+  val c2    = stage(c1)
+  val padY2 = RegNext(iy1 < 0.S || iy1 >= z(hinR))
+  val padX2 = RegNext(ix1 < 0.S || ix1 >= z(hinR))
+  val ciSh2 = RegNext((ci1 << lgHinwR)(AW - 1, 0))
+  val iySh2 = RegNext((iy1.asUInt << lgHinR)(AW - 1, 0))
+  val ix2   = RegNext(ix1.asUInt.pad(AW)(AW - 1, 0))
 
-  // ---------------- S3: partial address ----------------
+  // ---------------- S3: partial address + pad OR ----------------
   val c3     = stage(c2)
-  val pad3   = RegNext(pad2)
+  val pad3   = RegNext(padY2 || padX2)
   val part3  = RegNext(ciSh2 + iySh2)
   val ix3    = RegNext(ix2)
   val wcode3 = RegNext(wcode2)
@@ -272,7 +287,7 @@ class PersonCnn(cfg: CnnConfig) extends Module {
   val term8  = RegNext(Mux(sg7, 0.S - magS7, magS7))
 
   // ---------------- S9: accumulate (+ BN ROM read in parallel) ----------------
-  val acc     = RegInit(0.S(24.W))
+  val acc     = RegInit(0.S(accW.W))
   val accNext = Mux(c8.first, 0.S, acc) + term8
   when(c8.v) { acc := accNext }
 
@@ -284,27 +299,39 @@ class PersonCnn(cfg: CnnConfig) extends Module {
   val m9   = RegNext(mRom(c8.bn))
   val bq9  = RegNext(bqRom(c8.bn))
 
-  // ---------------- S10/S11: multiply (maps to DSP with input/mult/P regs) ----------------
+  // ---------------- S10: hai bộ nhân 18x18 (acc 24 bit tách 12 + 12) ----------------
+  // acc9 và m9 là thanh ghi thuần -> nhân -> thanh ghi thuần: dạng Quartus gom được vào khối DSP
   val c10     = stage(c9)
-  val prodA10 = RegNext(acc9 * m9)
+  val accLo9  = Cat(0.U(1.W), acc9.asUInt(11, 0)).asSInt     // 13 bit, luôn >= 0
+  val accHi9  = acc9.asUInt(23, 12).asSInt                    // 12 bit, có dấu
+  val pLo10   = RegNext(accLo9 * m9)                          // 13x16 -> 29 bit
+  val pHi10   = RegNext(accHi9 * m9)                          // 12x16 -> 28 bit
   val bq10    = RegNext(bq9)
-  val c11     = stage(c10)
-  val prodB11 = RegNext(prodA10)
-  val bq11    = RegNext(bq10)
 
-  // ---------------- S12: + Bq ----------------
-  val c12   = stage(c11)
-  val sum12 = RegNext(prodB11 +& bq11)
+  // ---------------- S10b: phần thấp + Bq ----------------
+  val c10b    = stage(c10)
+  val lo10b   = RegNext(pLo10 +& bq10)                        // 31 bit
+  val pHi10b  = RegNext(pHi10)
 
-  // ---------------- S13: arithmetic shift ----------------
-  val c13       = stage(c12)
-  val shifted13 = RegNext(sum12 >> shR)
+  // ---------------- S11: ghép phần cao (acc*m + Bq, 41 bit) ----------------
+  val c11   = stage(c10b)
+  val sum11 = RegNext((pHi10b << 12) +& lo10b)                // 40 bit +& 31 bit -> 41 bit
 
-  // ---------------- S14: ReLU + clamp[0,63] ----------------
+  // ---------------- S12: dấu + cờ tràn + dịch thô (bước 8) ----------------
+  val c12      = stage(c11)
+  val neg12    = RegNext(sum11.asUInt(sumW - 1))
+  val ovf12    = RegNext((sum11.asUInt & ovMaskR).orR)
+  val coarse12 = RegNext((sum11.asUInt >> Cat(shR(4, 3), 0.U(3.W)))(12, 0))
+
+  // ---------------- S13: dịch mịn 0..7, lấy 6 bit ----------------
+  val c13   = stage(c12)
+  val low13 = RegNext((coarse12 >> shR(2, 0))(5, 0))
+  val neg13 = RegNext(neg12)
+  val ovf13 = RegNext(ovf12)
+
+  // ---------------- S14: ReLU + clamp[0,63] (phẳng) ----------------
   val c14 = stage(c13)
-  val q14 = RegNext(
-    Mux(shifted13 < 0.S, 0.U(6.W), Mux(shifted13 > 63.S, 63.U(6.W), shifted13(5, 0)))
-  )
+  val q14 = RegNext((low13 | Fill(6, ovf13)) & Fill(6, !neg13))
 
   // ---------------- S15: 2x2 max pool + registered write ----------------
   val poolMax = RegInit(0.U(6.W))
@@ -339,20 +366,22 @@ class PersonCnn(cfg: CnnConfig) extends Module {
   }
 
   when(state === St.cfg) {
-    poolR   := poolV(layer)
-    hinR    := hInV(layer)
-    lgHinR  := lgHinV(layer)
-    lgHinwR := lgHinwV(layer)
-    shR     := shV(layer)
-    cin9R   := cin9V(layer)
+    poolR     := poolV(layer)
+    hinR      := hInV(layer)
+    lgHinR    := lgHinV(layer)
+    lgHinwR   := lgHinwV(layer)
+    shR       := shV(layer)
+    cin9R     := cin9V(layer)
+    ovMaskR   := ovMaskV(layer)
     kx.init(2.U); ky.init(2.U)
     ci.init(cinM1V(layer))
     px.init(pxMaxV(layer)); py.init(pxMaxV(layer))
     ocol.init(hOutM1V(layer)); orow.init(hOutM1V(layer))
     co.init(coutM1V(layer))
-    k     := 0.U
-    wrPtr := 0.U
-    state := St.conv
+    k         := 0.U
+    firstTapR := true.B
+    wrPtr     := 0.U
+    state     := St.conv
   }
 
   when(state === St.drain && !pipeBusy) {
@@ -396,23 +425,22 @@ class PersonCnn(cfg: CnnConfig) extends Module {
   when(gv2) { sAcc := sNext }
 
   // G3: latch finished sum + FC weight codes
-  val gv3    = RegNext(gv2 && gLast2, false.B)
-  // đặt sau khai báo gv3 / sFin3
-  val sFin3  = RegNext(sNext)
-  val gCh3 = RegNext(gCh2)
+  val gv3   = RegNext(gv2 && gLast2, false.B)
+  val sFin3 = RegNext(sNext)
+  val gCh3  = RegNext(gCh2)
   when(gv3) { printf("S[%d]=%d\n", gCh3, sFin3) }
   when(state === St.fin) { printf("acc0=%d acc1=%d\n", accFc(0), accFc(1)) }
- 
+
   val code3 = Seq.tabulate(2)(cl => RegNext(fcRom(gCh2 +& (cl * nFcIn).U)))
 
   // G4: shift, G5: sign, G6: accumulate
-  val gv4  = RegNext(gv3, false.B)
-  val gv5  = RegNext(gv4, false.B)
+  val gv4 = RegNext(gv3, false.B)
+  val gv5 = RegNext(gv4, false.B)
   for (cl <- 0 until 2) {
-    val e3   = code3(cl)(2, 0)
-    val mag4 = RegNext(Mux(e3 === 0.U, 0.U(20.W), (sFin3 << (7.U(3.W) - e3))(19, 0)))
-    val sg4  = RegNext(code3(cl)(3))
-    val m4S  = Cat(0.U(1.W), mag4).asSInt
+    val e3    = code3(cl)(2, 0)
+    val mag4  = RegNext(Mux(e3 === 0.U, 0.U(20.W), (sFin3 << (7.U(3.W) - e3))(19, 0)))
+    val sg4   = RegNext(code3(cl)(3))
+    val m4S   = Cat(0.U(1.W), mag4).asSInt
     val term5 = RegNext(Mux(sg4, 0.S - m4S, m4S))
     when(gv5) { accFc(cl) := accFc(cl) + term5 }
   }

@@ -1,3 +1,6 @@
 runs/
 __pycache__/
 *.pyc
+obj_dir/ 
+.bsp/ 
+.scala-build/
